@@ -1,0 +1,295 @@
+# ConnectLife Local Controller
+
+Local/hybrid control for a compatible Hisense air conditioner that uses the
+ConnectLife cloud. The project combines normal ConnectLife API control with a
+local replay fallback for recorded commands.
+
+**No credentials, device identifiers, keys, signed captures, or personal logs
+are included in this repository.** Each user must capture commands from their
+own AC. The capture procedure is reusable; the captured bytes are not.
+
+## Features
+
+- Online control through the ConnectLife API.
+- Automatic fallback to local replay after three failed cloud health checks.
+- Automatic return to online mode after two successful health checks.
+- Power, temperature, mode, fan-speed, and Sleep commands when recorded.
+- Online self-diagnosis and offline diagnosis from live fault flags.
+- Status updates when the physical remote changes the AC.
+- Windows Credential Manager storage for ConnectLife credentials.
+- Localhost-only command sockets and background startup without a console.
+- Capture inspection without printing captured payloads.
+
+This is not a general implementation of the ConnectLife encryption protocol.
+Offline replay supports only commands recorded from the same AC. It does not
+implement provisioning, factory reset, OTA updates, or key recovery.
+
+## Architecture
+
+```text
+Desktop CLI / another localhost client
+                |
+                v
+      controller.py (one instance)
+          |             |
+   healthy cloud    cloud unavailable
+          |             |
+ ConnectLife API    replay_server.py
+          |             |
+     Hisense cloud      local AC
+
+relay.py: real-cloud relay and capture path
+windows_dns.py: narrow hostname override forwarded to the PC
+```
+
+Online mode allows the ConnectLife app and PC control to coexist. During
+standalone replay, ConnectLife considers the AC offline. Offline control
+requires the PC and AC to be on the same LAN.
+
+## Requirements
+
+- A compatible ConnectLife AC whose firmware accepts the local test
+  certificate. This was verified on one Hisense window AC; other models and
+  firmware versions may not work.
+- A Windows PC with Python 3.12 and, for the documented WSL setup, WSL2.
+- A router that can override one DNS hostname without making the PC the DNS
+  server for the whole network.
+- Administrator privileges for low-numbered ports and firewall rules.
+- The Python packages in `requirements.txt`.
+
+The relay/replay services use TCP 443 and the DNS proxy uses UDP 53. Keep them
+on a trusted LAN only.
+
+## Installation
+
+Clone the repository and install the WSL-side dependencies:
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+For the Windows controller, install the same packages into its local dependency
+directory from the repository root:
+
+```powershell
+python.exe -m pip install --target fakecloud\.windows-deps -r requirements.txt
+```
+
+Generate a new local certificate. Do not reuse certificates from another user:
+
+```sh
+bash fakecloud/gen_cert.sh
+```
+
+`server.crt` and `server.key` are generated locally and ignored by Git.
+
+Copy and edit the controller configuration:
+
+```sh
+cp config.example.json fakecloud/config.json
+```
+
+Configuration fields:
+
+- `bind_ip`: this PC's LAN IP.
+- `upstream_dns`: the normal upstream resolver, usually the ISP modem/router.
+- `cloud_upstream_ip`: the real ConnectLife device-link IP, resolved before the
+  hostname override is enabled. The example value is a non-routable placeholder.
+- `hijack_domain`: normally `ac-eu-link.hijuconn.com`.
+- `offline_capture`: capture basename, without `.c2s.bin` or `.s2c.bin`.
+- `command_map`: JSON file mapping action names to captured command indices.
+
+Relative capture paths are resolved from `fakecloud/`. `config.json` is ignored
+by Git. `AC_LOCAL_CONFIG` can point to a configuration in another location.
+
+## Router DNS configuration
+
+Override **only** `ac-eu-link.hijuconn.com`, pointing it to the PC. Leave the
+router's WAN DNS automatic. Do not point the whole network's DNS at the PC;
+other devices would lose DNS whenever the PC is off.
+
+For routers using OpenWrt-style UCI, the persistent configuration is:
+
+```uci
+config domain
+    option name 'ac-eu-link.hijuconn.com'
+    option ip '192.168.31.100'
+```
+
+Replace the example IP with the PC's actual LAN IP. Apply the configuration and
+restart the router's DNS service. A `/etc/hosts` or `/etc/custom_hosts` entry
+may be temporary on some stock firmware and is not a substitute for verifying
+persistence. Reboot the router and confirm both of these results:
+
+```sh
+nslookup ac-eu-link.hijuconn.com 192.168.31.1  # returns the PC IP
+nslookup example.com 192.168.31.1              # returns normal public addresses
+```
+
+Replace `192.168.31.1` with the router's address. On other routers, use the
+corresponding static-DNS/dnsmasq hostname override.
+
+Resolve and record the real cloud IP through the normal upstream resolver
+before enabling the override. The relay needs this IP to avoid connecting back
+to itself.
+
+## Capture signed commands from your own AC
+
+Captures can contain session tokens, device identifiers, status data, and
+signed commands. Keep them private. The `fakecloud/captures/` directory is
+ignored by Git.
+
+1. Generate the certificate and configure the single-host DNS override.
+2. Start the real-cloud relay with the PC LAN IP and the real cloud IP:
+
+   ```powershell
+   python.exe fakecloud\relay.py --bind 192.168.31.100 --upstream-ip 203.0.113.10
+   ```
+
+   Replace both example addresses. Raw payloads are not logged by default.
+   `--log-payloads` exists for deliberate local research and may expose secrets.
+
+3. Reconnect or power-cycle only the AC if necessary to make it establish a new
+   TLS session through the relay.
+4. In one uninterrupted ConnectLife session, perform every command you want to
+   replay. Include the complete handshake, power on/off, every temperature,
+   modes, fan speeds, and Sleep on/off as applicable.
+5. Stop the relay after the commands have been acknowledged. It writes:
+
+   ```text
+   fakecloud/captures/<timestamp>-<connection>.c2s.bin
+   fakecloud/captures/<timestamp>-<connection>.s2c.bin
+   ```
+
+6. List the captured cloud-to-AC command indices without printing payloads:
+
+   ```sh
+   .venv/bin/python fakecloud/capture_tools.py list \
+     fakecloud/captures/<capture>.s2c.bin
+   ```
+
+   Indices are zero-based among `id=201` frames, not among all frames. Compare
+   this list with the order in which you performed commands in the app.
+
+7. Create `fakecloud/captures/commands.json` using
+   `examples/commands.json` as a starting point. Supported controller actions
+   are `on`, `off`, `temp16` through `temp30`, `fan`, `cool`, `dry`, `eco`,
+   `fanlow`, `fanmed`, `fanhigh`, `sleep`, and `sleepoff`.
+
+8. Validate the map:
+
+   ```sh
+   .venv/bin/python fakecloud/capture_tools.py validate \
+     fakecloud/captures/<capture>.s2c.bin fakecloud/captures/commands.json
+   ```
+
+9. Set `offline_capture` in `fakecloud/config.json` to
+   `captures/<capture>` and `command_map` to `captures/commands.json`.
+
+**Use one complete capture session. Do not mix command frames from different
+sessions.** A command map alone is insufficient; the matching `.s2c.bin` file
+and the complete recorded handshake responses are required.
+
+## Standalone replay
+
+Replay does not contact the cloud and does not require the device key:
+
+```powershell
+python.exe fakecloud\replay_server.py --bind 192.168.31.100 `
+  --capture fakecloud\captures\<capture> `
+  --command-map fakecloud\captures\commands.json
+```
+
+Use another terminal for status and commands:
+
+```powershell
+python.exe fakecloud\replay_cli.py status
+python.exe fakecloud\replay_cli.py on
+python.exe fakecloud\replay_cli.py temp26
+python.exe fakecloud\replay_cli.py sleepoff
+```
+
+ConnectLife is offline while replay owns the AC connection. Stop replay and
+start the relay (or the hybrid controller) to return to real-cloud operation.
+
+## Hybrid controller
+
+Store your ConnectLife credentials once in Windows Credential Manager:
+
+```powershell
+cd fakecloud
+python.exe controller_cli.py setup
+python.exe controller_cli.py run
+```
+
+The credential target is `ConnectLife/local-controller`. Credentials are not
+written to `config.json` or the repository. `reset-credentials` deletes the
+stored entry.
+
+From another terminal in `fakecloud/`:
+
+```powershell
+python.exe controller_cli.py status
+python.exe controller_cli.py diagnose
+python.exe controller_cli.py on
+python.exe controller_cli.py off
+python.exe controller_cli.py temp26
+python.exe controller_cli.py eco
+python.exe controller_cli.py fanhigh
+python.exe controller_cli.py sleep
+python.exe controller_cli.py sleepoff
+```
+
+The controller validates mode constraints: temperature requires power on and a
+temperature-capable mode, Fan mode has no temperature or Sleep control, and Dry
+mode fixes fan speed to High.
+
+For invisible startup at Windows login, create a Startup shortcut that runs
+`pythonw.exe controller_cli.py run` with `fakecloud/` as its working directory.
+Keep exactly one controller instance running.
+
+## Diagnosis
+
+Online diagnosis uses ConnectLife's self-check API and reports the entries in
+`selfCheckFailedList`. Offline diagnosis evaluates live fault flags for:
+
+- Indoor room and coil temperature sensors.
+- Indoor/outdoor communication.
+- Indoor control-panel EEPROM.
+- Overcooling and overheating protection.
+
+`self_check_inspect.py` is an optional standalone metadata inspector. Its output
+file contains identifiers and is ignored by Git.
+
+## Troubleshooting
+
+- **Missing configuration:** copy `config.example.json` to
+  `fakecloud/config.json` and replace every placeholder.
+- **AC does not reconnect:** confirm the router returns the PC IP only for the
+  device-link hostname and that TCP 443/UDP 53 are allowed on the LAN.
+- **Relay loops back to itself:** re-resolve `cloud_upstream_ip` through the
+  normal resolver, not through the override.
+- **Offline command is unavailable:** record that action in the same complete
+  capture and update the command map.
+- **ConnectLife shows the AC offline:** this is expected during standalone
+  replay; return to online mode for simultaneous app/cloud access.
+- **DNS fails when the PC is off:** the router is still using the PC as its
+  global DNS server. Restore automatic WAN DNS and keep only the hostname
+  override.
+- **After a router reboot:** verify that the override persists. A temporary
+  hosts file may be regenerated or deleted by stock firmware.
+
+## Security and limitations
+
+Use this only on devices and networks you own or are authorized to administer.
+The tested firmware accepts a self-signed certificate for the local relay.
+Keep capture files, payload logs, credentials, and certificates private, and do
+not expose the relay or control sockets to untrusted networks.
+
+No firmware is flashed by this project. No OTA, provisioning, reset, or key
+operations are supported. A future firmware update may change compatibility.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

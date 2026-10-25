@@ -1,0 +1,10 @@
+{
+  "off": 0,
+  "on": 1,
+  "temp26": 2,
+  "fan": 3,
+  "eco": 4,
+  "fanlow": 5,
+  "sleep": 6,
+  "sleepoff": 7
+}
