@@ -1,12 +1,16 @@
 {
   "bind_ip": "192.168.31.100",
+  "ac_ip": "192.168.31.101",
   "upstream_dns": "192.168.1.1",
   "cloud_upstream_dns": "1.1.1.1",
-  "cloud_upstream_ip": "203.0.113.10",
+  "cloud_upstream_ip": null,
   "hijack_domain": "ac-eu-link.hijuconn.com",
   "offline_capture": "captures/your-complete-session",
   "command_map": "captures/commands.json",
   "reconnect_grace_seconds": 60,
+  "local_control_retry_seconds": 10,
+  "health_interval_seconds": 30,
+  "health_retry_seconds": 5,
   "rehearsal_interval_seconds": 0,
   "rehearsal_timeout_seconds": 60,
   "rehearsal_command": "sleepoff"

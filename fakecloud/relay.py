@@ -148,17 +148,19 @@ def handle_client(raw_client, address, server_context, args, state):
     c2s_file = capture_base.with_suffix(".c2s.bin").open("ab")
     s2c_file = capture_base.with_suffix(".s2c.bin").open("ab")
     log(f"[{connection_id:04d}] capturing to {capture_base}.*.bin")
-    state.capture = s2c_file
-    state.attach(client)
+    connection_state = (state if getattr(args, "ac_ip", None) in (None, address[0])
+                        else ACState({}))
+    connection_state.capture = s2c_file
+    connection_state.attach(client)
 
     downstream = threading.Thread(
-        target=pipe, args=(upstream, client, "cloud -> AC", connection_id, s2c_file, state),
-        daemon=True)
+        target=pipe, args=(upstream, client, "cloud -> AC", connection_id, s2c_file,
+                           connection_state), daemon=True)
     downstream.start()
-    pipe(client, upstream, "AC -> cloud", connection_id, c2s_file, state)
+    pipe(client, upstream, "AC -> cloud", connection_id, c2s_file, connection_state)
     downstream.join(timeout=5)
 
-    state.detach(client)
+    connection_state.detach(client)
     for stream in (client, upstream, c2s_file, s2c_file):
         try:
             stream.close()
@@ -197,6 +199,7 @@ def main():
     global LOG_FILE, LOG_PAYLOADS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bind", required=True, help="LAN IP to listen on")
+    parser.add_argument("--ac-ip", help="target AC LAN IP used for local health and commands")
     parser.add_argument("--listen-port", type=int, default=443)
     parser.add_argument("--upstream-host", default="ac-eu-link.hijuconn.com",
                         help="real hostname, used for SNI and certificate checks")
@@ -228,9 +231,8 @@ def main():
         parser.error(str(error))
 
     state = ACState(command_frames)
-    if command_frames:
-        threading.Thread(target=control_listener, args=(state, args.control_port),
-                         daemon=True).start()
+    threading.Thread(target=control_listener, args=(state, args.control_port),
+                     daemon=True).start()
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1

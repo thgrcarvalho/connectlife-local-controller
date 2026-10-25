@@ -4,8 +4,8 @@ import asyncio
 import datetime
 import json
 import os
-import socket
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -19,10 +19,11 @@ from connectlife.api import ConnectLifeApi
 from credential_store import load_credentials
 CAPTURE_DIR = BASE_DIR / "captures"
 CONTROL_PORT = 8766
+ACTION_TIMEOUT = 30
 SUBPROCESS_LOG = CAPTURE_DIR / "controller-processes.log"
 CONFIG_PATH = Path(os.environ.get("AC_LOCAL_CONFIG", BASE_DIR / "config.json"))
 REQUIRED_CONFIG = (
-    "bind_ip", "upstream_dns", "cloud_upstream_dns", "hijack_domain",
+    "bind_ip", "ac_ip", "upstream_dns", "cloud_upstream_dns", "hijack_domain",
     "offline_capture", "command_map",
 )
 
@@ -76,19 +77,39 @@ def filtered_status(value):
     return {key: item for key, item in value.items() if key in STATUS_FIELDS}
 
 
-def query_replay(action):
-    with socket.create_connection(("127.0.0.1", 8765), timeout=20) as connection:
-        connection.sendall(json.dumps({"action": action}).encode() + b"\n")
-        data = b""
-        while b"\n" not in data:
-            chunk = connection.recv(65535)
-            if not chunk:
-                raise RuntimeError("replay control connection closed")
-            data += chunk
-    response = json.loads(data.split(b"\n", 1)[0])
-    if not response.get("ok"):
-        raise RuntimeError(response.get("error", "replay command failed"))
-    return response
+async def query_local(action, timeout=20):
+    async def request():
+        reader, writer = await asyncio.open_connection("127.0.0.1", 8765)
+        try:
+            writer.write(json.dumps({"action": action}).encode() + b"\n")
+            await writer.drain()
+            data = await reader.readline()
+            if not data:
+                raise RuntimeError("local control connection closed")
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+        response = json.loads(data)
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "local command failed"))
+        return response
+    return await asyncio.wait_for(request(), timeout=timeout)
+
+
+async def query_local_with_retry(action, retry_seconds, request_timeout=5):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + retry_seconds
+    while True:
+        try:
+            return await query_local(action, timeout=request_timeout)
+        except (OSError, RuntimeError, asyncio.TimeoutError):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise
+            await asyncio.sleep(min(0.25, remaining))
 
 
 def diagnostic_summary(status):
@@ -116,14 +137,21 @@ class Controller:
         self.action_lock = asyncio.Lock()
         self.online_grace_until = 0
         self.reconnect_grace = float(config.get("reconnect_grace_seconds", 60))
+        self.local_control_retry = float(config.get("local_control_retry_seconds", 10))
+        self.health_interval = float(config.get("health_interval_seconds", 30))
+        self.health_retry_interval = float(config.get("health_retry_seconds", 5))
         self.rehearsal_interval = float(config.get("rehearsal_interval_seconds", 0))
         self.rehearsal_timeout = float(config.get("rehearsal_timeout_seconds", 60))
         self.rehearsal_command = config.get("rehearsal_command", "sleepoff")
         self.last_rehearsal = None
+        self.process_started_at = {}
+        self.process_start_attempts = {}
+        self.process_retry_after = {}
         if self.reconnect_grace < 0 or self.rehearsal_interval < 0:
             raise ValueError("reconnect and rehearsal intervals cannot be negative")
-        if self.rehearsal_timeout <= 0:
-            raise ValueError("rehearsal_timeout_seconds must be positive")
+        if min(self.local_control_retry, self.health_interval,
+               self.health_retry_interval, self.rehearsal_timeout) <= 0:
+            raise ValueError("retry, health, and rehearsal timeouts must be positive")
         if self.rehearsal_interval and self.rehearsal_command not in ACTION_PROPERTIES:
             raise ValueError("rehearsal_command must be a recorded control action")
 
@@ -134,17 +162,33 @@ class Controller:
             stream.write(line + "\n")
 
     def start_process(self, name, arguments):
+        now = time.monotonic()
         process = self.processes.get(name)
         if process is not None and process.poll() is None:
+            if now - self.process_started_at.get(name, now) >= 60:
+                self.process_start_attempts[name] = 0
             return
+        if now < self.process_retry_after.get(name, 0):
+            return
+        attempt = self.process_start_attempts.get(name, 0)
         self.log(f"starting {name}")
-        with SUBPROCESS_LOG.open("a", encoding="utf-8") as stream:
-            self.processes[name] = subprocess.Popen(
-                arguments, cwd=BASE_DIR, stdout=stream, stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            with SUBPROCESS_LOG.open("a", encoding="utf-8") as stream:
+                self.processes[name] = subprocess.Popen(
+                    arguments, cwd=BASE_DIR, stdout=stream, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as error:
+            self.log(f"failed to start {name}: {type(error).__name__}")
+        self.process_started_at[name] = now
+        self.process_start_attempts[name] = attempt + 1
+        delay = min(60, 2 ** min(attempt, 6))
+        self.process_retry_after[name] = now + delay
 
     def stop_process(self, name):
         process = self.processes.pop(name, None)
+        self.process_started_at.pop(name, None)
+        self.process_start_attempts.pop(name, None)
+        self.process_retry_after.pop(name, None)
         if process is None:
             return
         self.log(f"stopping {name}")
@@ -200,6 +244,7 @@ class Controller:
             arguments = [
                 sys.executable, str(BASE_DIR / "relay.py"),
                 "--bind", self.config["bind_ip"],
+                "--ac-ip", self.config["ac_ip"],
                 "--upstream-dns", self.config["cloud_upstream_dns"],
                 "--log-file", str(CAPTURE_DIR / "online-relay.log"),
             ]
@@ -246,10 +291,24 @@ class Controller:
             self.log(f"cloud health check failed: {type(error).__name__}")
             return False, False
 
-    def update_health(self, cloud_reachable, appliance_connected, now):
+    async def check_relay(self):
+        try:
+            response = await query_local("status", timeout=2)
+            return bool(response.get("connected"))
+        except (OSError, RuntimeError, asyncio.TimeoutError):
+            return False
+
+    def update_health(self, cloud_reachable, appliance_connected, relay_connected, now):
         if self.mode == "online":
             in_grace = now < self.online_grace_until
-            healthy = cloud_reachable and (appliance_connected or in_grace)
+            if cloud_reachable and not appliance_connected and not in_grace:
+                if not relay_connected:
+                    self.cloud_failures = 0
+                    self.cloud_successes = 0
+                    return
+                healthy = False
+            else:
+                healthy = cloud_reachable and (appliance_connected or in_grace)
             if healthy:
                 self.cloud_successes += 1
                 self.cloud_failures = 0
@@ -279,15 +338,17 @@ class Controller:
         self.last_rehearsal = asyncio.get_running_loop().time()
         try:
             self.set_mode("offline")
-            deadline = asyncio.get_running_loop().time() + self.rehearsal_timeout
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.rehearsal_timeout
             while True:
-                response = await asyncio.to_thread(query_replay, "status")
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError("AC did not reconnect for offline rehearsal")
+                response = await query_local_with_retry("status", remaining)
                 if response.get("connected"):
                     break
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise TimeoutError("AC did not reconnect for offline rehearsal")
-                await asyncio.sleep(2)
-            await asyncio.to_thread(query_replay, self.rehearsal_command)
+                await asyncio.sleep(min(2, max(0, deadline - loop.time())))
+            await query_local(self.rehearsal_command)
             self.log("offline rehearsal acknowledged")
         except Exception as error:
             self.log(f"offline rehearsal failed: {type(error).__name__}")
@@ -299,6 +360,7 @@ class Controller:
         server = None
         loop = asyncio.get_running_loop()
         self.last_rehearsal = loop.time()
+        next_health_check = loop.time()
         try:
             self.set_mode("online")
             server = await asyncio.start_server(
@@ -307,12 +369,20 @@ class Controller:
             while self.running:
                 async with self.action_lock:
                     self.supervise_processes()
-                    cloud_reachable, appliance_connected = await self.check_cloud()
                     now = loop.time()
-                    self.update_health(cloud_reachable, appliance_connected, now)
-                    if (self.mode == "online" and cloud_reachable
-                            and appliance_connected and self.rehearsal_due(now)):
-                        await self.rehearse_offline()
+                    if now >= next_health_check:
+                        relay_connected = await self.check_relay() if self.mode == "online" else False
+                        cloud_reachable, appliance_connected = await self.check_cloud()
+                        now = loop.time()
+                        self.update_health(
+                            cloud_reachable, appliance_connected, relay_connected, now)
+                        if (self.mode == "online" and cloud_reachable
+                                and appliance_connected and self.rehearsal_due(now)):
+                            await self.rehearse_offline()
+                        interval = (self.health_retry_interval
+                                    if self.mode == "offline" or self.cloud_failures
+                                    else self.health_interval)
+                        next_health_check = loop.time() + interval
                 await asyncio.sleep(5)
         finally:
             if server is not None:
@@ -328,7 +398,7 @@ class Controller:
             status = filtered_status(devices[0].get("statusList", {}))
             connected = devices[0].get("offlineState") in (1, "1")
         else:
-            response = await asyncio.to_thread(query_replay, "status")
+            response = await query_local_with_retry("status", self.local_control_retry)
             status = filtered_status(response.get("status", {}))
             connected = response.get("connected", False)
         self.last_status = status
@@ -355,7 +425,7 @@ class Controller:
             await self.cloud_request(lambda: self.api.update_appliance(self.puid, properties))
             await asyncio.sleep(1)
             return await self.get_status()
-        return await asyncio.to_thread(query_replay, action)
+        return await query_local(action)
 
     async def get_diagnostics(self):
         if self.mode == "offline":
@@ -370,6 +440,12 @@ class Controller:
                 result["failed"].append(item["statusKey"])
         return result
 
+    async def run_client_action(self, action, reader):
+        async with self.action_lock:
+            if reader.at_eof():
+                return None
+            return await self.handle_action(action)
+
     async def handle_connection(self, reader, writer):
         try:
             data = await asyncio.wait_for(reader.readline(), timeout=30)
@@ -378,17 +454,24 @@ class Controller:
             action = json.loads(data).get("action")
             if action not in ALLOWED_ACTIONS:
                 raise ValueError("unsupported action")
-            async with self.action_lock:
-                result = await self.handle_action(action)
-                response = {"ok": True, "mode": self.mode, **result}
+            result = await asyncio.wait_for(
+                self.run_client_action(action, reader), timeout=ACTION_TIMEOUT)
+            response = ({"ok": True, "mode": self.mode, **result}
+                        if result is not None else None)
+        except asyncio.TimeoutError:
+            response = {"ok": False, "mode": self.mode, "error": "action timed out"}
         except Exception as error:
             response = {"ok": False, "mode": self.mode, "error": str(error)}
         try:
-            writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
-            await writer.drain()
+            if response is not None:
+                writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
+                await writer.drain()
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
 
 
 async def main():

@@ -11,12 +11,15 @@ own AC. The capture procedure is reusable; the captured bytes are not.
 ## Features
 
 - Online control through the ConnectLife API.
-- Health checks for both cloud reachability and appliance connectivity.
-- Automatic fallback to local replay after three failed online health checks.
+- Health checks for cloud reachability, appliance connectivity, and the relay's
+  local AC connection, with no replay flapping while the AC is absent.
+- Automatic fallback to local replay after three actionable online health failures.
 - Automatic return to online mode after two successful cloud checks, with time
   for the appliance to reconnect before its connectivity is enforced again.
-- Relay, replay, and DNS process supervision with automatic restart.
-- Serialized health transitions and client commands on one event loop.
+- Relay, replay, and DNS process supervision with bounded exponential restart backoff.
+- Serialized health transitions and client commands on one event loop, with
+  cancellable local I/O and bounded queued/action execution time.
+- Thirty-second healthy cloud polling and five-second failure/recovery polling.
 - Power, temperature, mode, fan-speed, and Sleep commands when recorded.
 - Online self-diagnosis and offline diagnosis from live fault flags.
 - Status updates when the physical remote changes the AC.
@@ -100,19 +103,26 @@ Copy-Item config.example.json fakecloud\config.json
 Configuration fields:
 
 - `bind_ip`: this PC's LAN IP.
+- `ac_ip`: the target AC's LAN IP. The relay uses it to isolate local health and
+  command state from any other ConnectLife devices on the network. A DHCP
+  reservation for the AC is recommended.
 - `upstream_dns`: the normal LAN resolver used by the DNS proxy, usually the
   ISP modem/router.
 - `cloud_upstream_dns`: a non-hijacked resolver, such as a public DNS service,
   used to discover the real device-link address whenever the relay reconnects.
   Do not use the router that contains the device-link hostname override.
 - `cloud_upstream_ip`: optional fallback if dynamic resolution fails. Resolve it
-  outside the hijack before adding it; remove the non-routable example value if
-  no verified fallback is available.
+  outside the hijack before adding it. `null` disables the fallback.
 - `hijack_domain`: normally `ac-eu-link.hijuconn.com`.
 - `offline_capture`: capture basename, without `.c2s.bin` or `.s2c.bin`.
 - `command_map`: JSON file mapping action names to captured command indices.
 - `reconnect_grace_seconds`: time allowed for the AC to reconnect after entering
   online mode before appliance disconnects count as failed health checks.
+- `local_control_retry_seconds`: deadline for replay's localhost control service
+  to become ready when a client request arrives immediately after failover.
+- `health_interval_seconds`: cloud polling interval while healthy; defaults to 30.
+- `health_retry_seconds`: polling interval during failures and offline recovery;
+  defaults to 5. Child supervision continues every five seconds independently.
 - `rehearsal_interval_seconds`: optional offline rehearsal interval; `0` disables
   rehearsal. See the rehearsal section before enabling it.
 - `rehearsal_timeout_seconds` and `rehearsal_command`: reconnect deadline and the
@@ -263,11 +273,18 @@ The controller validates mode constraints: temperature requires power on and a
 temperature-capable mode, Fan mode has no temperature or Sleep control, and Dry
 mode fixes fan speed to High. Client actions, health checks, and mode changes
 are serialized so they cannot modify shared API and connection state concurrently.
+A server-side 30-second deadline covers both lock waiting and execution. Requests
+whose clients disconnect while queued are discarded before execution.
 
-Online health requires both a reachable cloud API and an appliance that reports
-itself connected. Offline recovery initially requires only cloud reachability;
-after switching online, `reconnect_grace_seconds` allows the AC to reconnect.
-The controller also restarts missing or exited relay, replay, and DNS children.
+Cloud API failures can trigger offline replay whether or not the AC is present.
+If the API is reachable but reports the appliance offline, the controller checks
+the relay's localhost status for `ac_ip`; other devices using the relay have
+isolated state and cannot affect this decision. A live relay-to-AC connection
+makes replay useful; no local connection means the AC is absent, so the
+controller waits instead of flapping between modes. Offline recovery initially requires only cloud
+reachability; after switching online, `reconnect_grace_seconds` allows the AC to
+reconnect. The controller restarts missing or exited relay, replay, and DNS
+children with bounded exponential backoff after repeated failures.
 
 For invisible startup at Windows login, create a Startup shortcut that runs
 `pythonw.exe controller_cli.py run` using an absolute native Windows script path
