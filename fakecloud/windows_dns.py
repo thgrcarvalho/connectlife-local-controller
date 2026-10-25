@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Windows-side DNS proxy for the fake-cloud probe.
+"""Windows-side DNS proxy for the local relay and replay services.
 
-Run with Windows Python while WSL2 mirrored networking is enabled. Windows
-can bind the LAN IP specifically even when ICS owns 0.0.0.0:53; WSL's UDP
-forwarding cannot. Only the DNS service runs here. The AC's TLS connections
-still go to probe.py in WSL, which has already been verified from the LAN.
+Windows Python can bind the LAN IP specifically even when ICS owns 0.0.0.0:53.
+The relay and replay services also run with native Windows Python, so the
+runtime does not depend on WSL.
 
 Standard library only:
   python.exe windows_dns.py --bind 192.168.31.100

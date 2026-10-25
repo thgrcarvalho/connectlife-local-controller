@@ -6,11 +6,11 @@ open a second, certificate-verified TLS connection to Hisense. Payloads are
 forwarded unchanged in both directions and written to per-connection binary
 capture files. Raw payload logging is disabled unless --log-payloads is set.
 
-Use a real upstream IP resolved through a DNS server that is not being
-hijacked; otherwise the relay could resolve the cloud back to itself.
+Resolve the cloud through a DNS server that is not being hijacked; otherwise
+the relay could connect back to itself. A verified static IP is an optional fallback.
 
   sudo ../.venv/bin/python relay.py --bind 192.168.31.100 \
-      --upstream-ip 203.0.113.10
+      --upstream-dns 1.1.1.1
 """
 
 import argparse
@@ -19,13 +19,20 @@ import itertools
 import json
 import socket
 import ssl
+import sys
 import threading
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+WINDOWS_DEPS = BASE_DIR / ".windows-deps"
+if WINDOWS_DEPS.is_dir():
+    sys.path.insert(0, str(WINDOWS_DEPS))
+
+from dnslib import DNSRecord, QTYPE
 
 import replay_server
 from replay_server import ACState, control_listener, load_frames, parse_frame
 
-BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "relay.log"
 CERT_FILE = BASE_DIR / "server.crt"
 KEY_FILE = BASE_DIR / "server.key"
@@ -91,6 +98,15 @@ def pipe(source, destination, direction, connection_id, capture, state):
             pass
 
 
+def resolve_upstream(host, dns_server, timeout=5):
+    query = DNSRecord.question(host, "A")
+    response = DNSRecord.parse(query.send(dns_server, 53, timeout=timeout))
+    addresses = [str(record.rdata) for record in response.rr if record.rtype == QTYPE.A]
+    if not addresses:
+        raise OSError(f"no A record returned for {host}")
+    return addresses[0]
+
+
 def handle_client(raw_client, address, server_context, args, state):
     connection_id = next(_connection_ids)
     peer = f"{address[0]}:{address[1]}"
@@ -104,14 +120,23 @@ def handle_client(raw_client, address, server_context, args, state):
     log(f"[{connection_id:04d}] {peer} client TLS OK: "
         f"{client.version()} {client.cipher()[0]}")
     try:
+        upstream_ip = args.upstream_ip
+        if args.upstream_dns:
+            try:
+                upstream_ip = resolve_upstream(args.upstream_host, args.upstream_dns)
+            except Exception as error:
+                log(f"[{connection_id:04d}] dynamic upstream resolution failed: "
+                    f"{type(error).__name__}")
+        if not upstream_ip:
+            raise OSError("no upstream address available")
         upstream_socket = socket.create_connection(
-            (args.upstream_ip, args.upstream_port), timeout=10)
+            (upstream_ip, args.upstream_port), timeout=10)
         upstream_context = ssl.create_default_context()
         upstream = upstream_context.wrap_socket(
             upstream_socket, server_hostname=args.upstream_host)
         upstream.settimeout(None)
         log(f"[{connection_id:04d}] connected to real "
-            f"{args.upstream_host} ({args.upstream_ip}) via {upstream.version()}")
+            f"{args.upstream_host} ({upstream_ip}) via {upstream.version()}")
     except (OSError, ssl.SSLError) as error:
         log(f"[{connection_id:04d}] upstream connection failed: {error}")
         client.close()
@@ -124,7 +149,6 @@ def handle_client(raw_client, address, server_context, args, state):
     s2c_file = capture_base.with_suffix(".s2c.bin").open("ab")
     log(f"[{connection_id:04d}] capturing to {capture_base}.*.bin")
     state.capture = s2c_file
-    state.capture_path = capture_base
     state.attach(client)
 
     downstream = threading.Thread(
@@ -176,8 +200,10 @@ def main():
     parser.add_argument("--listen-port", type=int, default=443)
     parser.add_argument("--upstream-host", default="ac-eu-link.hijuconn.com",
                         help="real hostname, used for SNI and certificate checks")
-    parser.add_argument("--upstream-ip", required=True,
-                        help="real cloud IP; must be resolved outside the hijack")
+    parser.add_argument("--upstream-ip",
+                        help="optional fallback cloud IP, resolved outside the hijack")
+    parser.add_argument("--upstream-dns",
+                        help="non-hijacked DNS resolver used for dynamic cloud lookups")
     parser.add_argument("--upstream-port", type=int, default=443)
     parser.add_argument("--capture", type=Path,
                         help="capture basename for optional command injection")
@@ -188,6 +214,8 @@ def main():
     parser.add_argument("--log-payloads", action="store_true",
                         help="log raw payloads, including sensitive session data")
     args = parser.parse_args()
+    if not args.upstream_dns and not args.upstream_ip:
+        parser.error("either --upstream-dns or --upstream-ip is required")
     LOG_FILE = args.log_file
     LOG_PAYLOADS = args.log_payloads
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -201,12 +229,6 @@ def main():
 
     state = ACState(command_frames)
     if command_frames:
-        def refresh_commands():
-            capture = getattr(state, "capture_path", args.capture)
-            updated = load_command_library(capture, args.command_map)
-            state.command_frames.clear()
-            state.command_frames.update(updated)
-        state.before_command = refresh_commands
         threading.Thread(target=control_listener, args=(state, args.control_port),
                          daemon=True).start()
 
@@ -223,7 +245,8 @@ def main():
     listener.bind((args.bind, args.listen_port))
     listener.listen(16)
     log(f"listening on {args.bind}:{args.listen_port}; relaying to "
-        f"{args.upstream_host} at {args.upstream_ip}:{args.upstream_port}")
+        f"{args.upstream_host}:{args.upstream_port} with dynamic resolution "
+        f"{'enabled' if args.upstream_dns else 'disabled'}")
 
     try:
         while True:

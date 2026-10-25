@@ -7,7 +7,6 @@ import os
 import socket
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,7 +22,7 @@ CONTROL_PORT = 8766
 SUBPROCESS_LOG = CAPTURE_DIR / "controller-processes.log"
 CONFIG_PATH = Path(os.environ.get("AC_LOCAL_CONFIG", BASE_DIR / "config.json"))
 REQUIRED_CONFIG = (
-    "bind_ip", "upstream_dns", "cloud_upstream_ip", "hijack_domain",
+    "bind_ip", "upstream_dns", "cloud_upstream_dns", "hijack_domain",
     "offline_capture", "command_map",
 )
 
@@ -114,6 +113,19 @@ class Controller:
         self.processes = {}
         self.running = True
         self.last_status = {}
+        self.action_lock = asyncio.Lock()
+        self.online_grace_until = 0
+        self.reconnect_grace = float(config.get("reconnect_grace_seconds", 60))
+        self.rehearsal_interval = float(config.get("rehearsal_interval_seconds", 0))
+        self.rehearsal_timeout = float(config.get("rehearsal_timeout_seconds", 60))
+        self.rehearsal_command = config.get("rehearsal_command", "sleepoff")
+        self.last_rehearsal = None
+        if self.reconnect_grace < 0 or self.rehearsal_interval < 0:
+            raise ValueError("reconnect and rehearsal intervals cannot be negative")
+        if self.rehearsal_timeout <= 0:
+            raise ValueError("rehearsal_timeout_seconds must be positive")
+        if self.rehearsal_interval and self.rehearsal_command not in ACTION_PROPERTIES:
+            raise ValueError("rehearsal_command must be a recorded control action")
 
     def log(self, message):
         line = f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {message}"
@@ -148,7 +160,8 @@ class Controller:
         script = (
             "$names = @('windows_dns.py','replay_server.py','relay.py'); "
             "Get-CimInstance Win32_Process | Where-Object { "
-            "$process = $_; $process.Name -eq 'python.exe' -and $process.CommandLine -and "
+            "$process = $_; ($process.Name -eq 'python.exe' -or "
+            "$process.Name -eq 'pythonw.exe') -and $process.CommandLine -and "
             "($names | Where-Object { $process.CommandLine.Contains($_) }) } | "
             "ForEach-Object { Stop-Process -Id $process.ProcessId -Force }")
         subprocess.run(["powershell.exe", "-NoProfile", "-Command", script],
@@ -158,41 +171,59 @@ class Controller:
         for name in list(self.processes):
             self.stop_process(name)
 
-    def set_mode(self, mode):
-        if mode == self.mode and self.processes.get("dns") is not None:
-            return
-        self.log(f"switching to {mode} mode")
-        self.stop_all()
-        self.mode = mode
-        if mode == "offline":
-            self.start_process("replay", [
+    def expected_processes(self, mode=None):
+        selected = mode or self.mode
+        return ("replay", "dns") if selected == "offline" else ("relay", "dns")
+
+    def processes_ready(self, mode=None):
+        return all(
+            (process := self.processes.get(name)) is not None and process.poll() is None
+            for name in self.expected_processes(mode))
+
+    def process_arguments(self, name):
+        if name == "dns":
+            return [
+                sys.executable, str(BASE_DIR / "windows_dns.py"),
+                "--bind", self.config["bind_ip"],
+                "--upstream", self.config["upstream_dns"],
+                "--hijack", self.config["hijack_domain"],
+            ]
+        if name == "replay":
+            return [
                 sys.executable, str(BASE_DIR / "replay_server.py"),
                 "--bind", self.config["bind_ip"],
                 "--capture", str(configured_path(self.config["offline_capture"])),
                 "--command-map", str(configured_path(self.config["command_map"])),
                 "--log-file", str(CAPTURE_DIR / "offline-replay.log"),
-            ])
-            self.start_process("dns", [
-                sys.executable, str(BASE_DIR / "windows_dns.py"),
-                "--bind", self.config["bind_ip"],
-                "--upstream", self.config["upstream_dns"],
-                "--hijack", self.config["hijack_domain"],
-            ])
-        else:
-            self.start_process("relay", [
+            ]
+        if name == "relay":
+            arguments = [
                 sys.executable, str(BASE_DIR / "relay.py"),
                 "--bind", self.config["bind_ip"],
-                "--upstream-ip", self.config["cloud_upstream_ip"],
+                "--upstream-dns", self.config["cloud_upstream_dns"],
                 "--log-file", str(CAPTURE_DIR / "online-relay.log"),
-            ])
-            self.start_process("dns", [
-                sys.executable, str(BASE_DIR / "windows_dns.py"),
-                "--bind", self.config["bind_ip"],
-                "--upstream", self.config["upstream_dns"],
-                "--hijack", self.config["hijack_domain"],
-            ])
+            ]
+            if self.config.get("cloud_upstream_ip"):
+                arguments.extend(["--upstream-ip", self.config["cloud_upstream_ip"]])
+            return arguments
+        raise ValueError(f"unknown process: {name}")
+
+    def supervise_processes(self):
+        for name in self.expected_processes():
+            self.start_process(name, self.process_arguments(name))
+
+    def set_mode(self, mode):
+        if mode == self.mode and self.processes_ready(mode):
+            return
+        self.log(f"switching to {mode} mode")
+        self.stop_all()
+        self.mode = mode
+        for name in self.expected_processes():
+            self.start_process(name, self.process_arguments(name))
         self.cloud_failures = 0
         self.cloud_successes = 0
+        if mode == "online":
+            self.online_grace_until = asyncio.get_running_loop().time() + self.reconnect_grace
 
     async def cloud_request(self, callback):
         test_file = CAPTURE_DIR / "controller-test-server.txt"
@@ -209,36 +240,84 @@ class Controller:
             if not devices:
                 raise RuntimeError("no appliances returned")
             self.puid = devices[0]["puid"]
-            return True
+            connected = devices[0].get("offlineState") in (1, "1")
+            return True, connected
         except Exception as error:
             self.log(f"cloud health check failed: {type(error).__name__}")
-            return False
+            return False, False
+
+    def update_health(self, cloud_reachable, appliance_connected, now):
+        if self.mode == "online":
+            in_grace = now < self.online_grace_until
+            healthy = cloud_reachable and (appliance_connected or in_grace)
+            if healthy:
+                self.cloud_successes += 1
+                self.cloud_failures = 0
+                if appliance_connected:
+                    self.online_grace_until = 0
+            else:
+                self.cloud_failures += 1
+                self.cloud_successes = 0
+                if self.cloud_failures >= 3:
+                    self.set_mode("offline")
+            return
+        if cloud_reachable:
+            self.cloud_successes += 1
+            self.cloud_failures = 0
+        else:
+            self.cloud_failures += 1
+            self.cloud_successes = 0
+        if self.cloud_successes >= 2:
+            self.set_mode("online")
+
+    def rehearsal_due(self, now):
+        return (self.rehearsal_interval > 0 and self.last_rehearsal is not None
+                and now - self.last_rehearsal >= self.rehearsal_interval)
+
+    async def rehearse_offline(self):
+        self.log(f"starting offline rehearsal with {self.rehearsal_command}")
+        self.last_rehearsal = asyncio.get_running_loop().time()
+        try:
+            self.set_mode("offline")
+            deadline = asyncio.get_running_loop().time() + self.rehearsal_timeout
+            while True:
+                response = await asyncio.to_thread(query_replay, "status")
+                if response.get("connected"):
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("AC did not reconnect for offline rehearsal")
+                await asyncio.sleep(2)
+            await asyncio.to_thread(query_replay, self.rehearsal_command)
+            self.log("offline rehearsal acknowledged")
+        except Exception as error:
+            self.log(f"offline rehearsal failed: {type(error).__name__}")
+        finally:
+            self.set_mode("online")
 
     async def run(self):
         self.stop_stale_processes()
-        self.set_mode("online")
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", CONTROL_PORT))
-        listener.listen(16)
-        self.log(f"controller listening on 127.0.0.1:{CONTROL_PORT}")
-        threading.Thread(target=self.control_loop, args=(listener,), daemon=True).start()
+        server = None
+        loop = asyncio.get_running_loop()
+        self.last_rehearsal = loop.time()
         try:
+            self.set_mode("online")
+            server = await asyncio.start_server(
+                self.handle_connection, "127.0.0.1", CONTROL_PORT)
+            self.log(f"controller listening on 127.0.0.1:{CONTROL_PORT}")
             while self.running:
-                healthy = await self.check_cloud()
-                if healthy:
-                    self.cloud_successes += 1
-                    self.cloud_failures = 0
-                    if self.mode == "offline" and self.cloud_successes >= 2:
-                        self.set_mode("online")
-                else:
-                    self.cloud_failures += 1
-                    self.cloud_successes = 0
-                    if self.mode == "online" and self.cloud_failures >= 3:
-                        self.set_mode("offline")
+                async with self.action_lock:
+                    self.supervise_processes()
+                    cloud_reachable, appliance_connected = await self.check_cloud()
+                    now = loop.time()
+                    self.update_health(cloud_reachable, appliance_connected, now)
+                    if (self.mode == "online" and cloud_reachable
+                            and appliance_connected and self.rehearsal_due(now)):
+                        await self.rehearse_offline()
                 await asyncio.sleep(5)
         finally:
-            listener.close()
+            if server is not None:
+                server.close()
+                await server.wait_closed()
             self.stop_all()
 
     async def get_status(self):
@@ -249,7 +328,7 @@ class Controller:
             status = filtered_status(devices[0].get("statusList", {}))
             connected = devices[0].get("offlineState") in (1, "1")
         else:
-            response = query_replay("status")
+            response = await asyncio.to_thread(query_replay, "status")
             status = filtered_status(response.get("status", {}))
             connected = response.get("connected", False)
         self.last_status = status
@@ -276,7 +355,7 @@ class Controller:
             await self.cloud_request(lambda: self.api.update_appliance(self.puid, properties))
             await asyncio.sleep(1)
             return await self.get_status()
-        return query_replay(action)
+        return await asyncio.to_thread(query_replay, action)
 
     async def get_diagnostics(self):
         if self.mode == "offline":
@@ -291,38 +370,25 @@ class Controller:
                 result["failed"].append(item["statusKey"])
         return result
 
-    async def handle_connection(self, connection):
+    async def handle_connection(self, reader, writer):
         try:
-            connection.settimeout(30)
-            data = b""
-            while b"\n" not in data:
-                chunk = connection.recv(4096)
-                if not chunk:
-                    raise ValueError("empty request")
-                data += chunk
-            action = json.loads(data.split(b"\n", 1)[0]).get("action")
+            data = await asyncio.wait_for(reader.readline(), timeout=30)
+            if not data:
+                raise ValueError("empty request")
+            action = json.loads(data).get("action")
             if action not in ALLOWED_ACTIONS:
                 raise ValueError("unsupported action")
-            result = await self.handle_action(action)
-            response = {"ok": True, "mode": self.mode, **result}
+            async with self.action_lock:
+                result = await self.handle_action(action)
+                response = {"ok": True, "mode": self.mode, **result}
         except Exception as error:
             response = {"ok": False, "mode": self.mode, "error": str(error)}
         try:
-            connection.sendall(json.dumps(response, ensure_ascii=False).encode() + b"\n")
+            writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
+            await writer.drain()
         finally:
-            connection.close()
-
-    def control_loop(self, listener):
-        while self.running:
-            try:
-                connection, _ = listener.accept()
-            except OSError:
-                break
-            threading.Thread(target=self.handle_connection_thread,
-                             args=(connection,), daemon=True).start()
-
-    def handle_connection_thread(self, connection):
-        asyncio.run(self.handle_connection(connection))
+            writer.close()
+            await writer.wait_closed()
 
 
 async def main():

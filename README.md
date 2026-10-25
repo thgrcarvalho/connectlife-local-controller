@@ -11,8 +11,12 @@ own AC. The capture procedure is reusable; the captured bytes are not.
 ## Features
 
 - Online control through the ConnectLife API.
-- Automatic fallback to local replay after three failed cloud health checks.
-- Automatic return to online mode after two successful health checks.
+- Health checks for both cloud reachability and appliance connectivity.
+- Automatic fallback to local replay after three failed online health checks.
+- Automatic return to online mode after two successful cloud checks, with time
+  for the appliance to reconnect before its connectivity is enforced again.
+- Relay, replay, and DNS process supervision with automatic restart.
+- Serialized health transitions and client commands on one event loop.
 - Power, temperature, mode, fan-speed, and Sleep commands when recorded.
 - Online self-diagnosis and offline diagnosis from live fault flags.
 - Status updates when the physical remote changes the AC.
@@ -51,7 +55,8 @@ requires the PC and AC to be on the same LAN.
 - A compatible ConnectLife AC whose firmware accepts the local test
   certificate. This was verified on one Hisense window AC; other models and
   firmware versions may not work.
-- A Windows PC with Python 3.12 and, for the documented WSL setup, WSL2.
+- A Windows PC with Python 3.12. WSL is optional for development tools, but the
+  reliable runtime layout uses only native Windows files and processes.
 - A router that can override one DNS hostname without making the PC the DNS
   server for the whole network.
 - Administrator privileges for low-numbered ports and firewall rules.
@@ -62,18 +67,19 @@ on a trusted LAN only.
 
 ## Installation
 
-Clone the repository and install the WSL-side dependencies:
+For a dependable startup, deploy the controller on a local Windows filesystem,
+not through a `\\wsl.localhost` path. Install its dependencies from the repository
+root:
+
+```powershell
+python.exe -m pip install --target fakecloud\.windows-deps -r requirements.txt
+```
+
+WSL is useful for the optional capture-inspection tools:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-```
-
-For the Windows controller, install the same packages into its local dependency
-directory from the repository root:
-
-```powershell
-python.exe -m pip install --target fakecloud\.windows-deps -r requirements.txt
 ```
 
 Generate a new local certificate. Do not reuse certificates from another user:
@@ -82,23 +88,35 @@ Generate a new local certificate. Do not reuse certificates from another user:
 bash fakecloud/gen_cert.sh
 ```
 
-`server.crt` and `server.key` are generated locally and ignored by Git.
+`server.crt` and `server.key` are generated locally and ignored by Git. Bash and
+OpenSSL are needed only to generate the certificate, not by the running service.
 
 Copy and edit the controller configuration:
 
-```sh
-cp config.example.json fakecloud/config.json
+```powershell
+Copy-Item config.example.json fakecloud\config.json
 ```
 
 Configuration fields:
 
 - `bind_ip`: this PC's LAN IP.
-- `upstream_dns`: the normal upstream resolver, usually the ISP modem/router.
-- `cloud_upstream_ip`: the real ConnectLife device-link IP, resolved before the
-  hostname override is enabled. The example value is a non-routable placeholder.
+- `upstream_dns`: the normal LAN resolver used by the DNS proxy, usually the
+  ISP modem/router.
+- `cloud_upstream_dns`: a non-hijacked resolver, such as a public DNS service,
+  used to discover the real device-link address whenever the relay reconnects.
+  Do not use the router that contains the device-link hostname override.
+- `cloud_upstream_ip`: optional fallback if dynamic resolution fails. Resolve it
+  outside the hijack before adding it; remove the non-routable example value if
+  no verified fallback is available.
 - `hijack_domain`: normally `ac-eu-link.hijuconn.com`.
 - `offline_capture`: capture basename, without `.c2s.bin` or `.s2c.bin`.
 - `command_map`: JSON file mapping action names to captured command indices.
+- `reconnect_grace_seconds`: time allowed for the AC to reconnect after entering
+  online mode before appliance disconnects count as failed health checks.
+- `rehearsal_interval_seconds`: optional offline rehearsal interval; `0` disables
+  rehearsal. See the rehearsal section before enabling it.
+- `rehearsal_timeout_seconds` and `rehearsal_command`: reconnect deadline and the
+  recorded command used by an enabled rehearsal.
 
 Relative capture paths are resolved from `fakecloud/`. `config.json` is ignored
 by Git. `AC_LOCAL_CONFIG` can point to a configuration in another location.
@@ -130,9 +148,9 @@ nslookup example.com 192.168.31.1              # returns normal public addresses
 Replace `192.168.31.1` with the router's address. On other routers, use the
 corresponding static-DNS/dnsmasq hostname override.
 
-Resolve and record the real cloud IP through the normal upstream resolver
-before enabling the override. The relay needs this IP to avoid connecting back
-to itself.
+The relay resolves the real cloud hostname through `cloud_upstream_dns` on each
+new upstream connection. This resolver must be outside the hostname override.
+An optional verified `cloud_upstream_ip` is used only if that lookup fails.
 
 ## Capture signed commands from your own AC
 
@@ -141,13 +159,13 @@ signed commands. Keep them private. The `fakecloud/captures/` directory is
 ignored by Git.
 
 1. Generate the certificate and configure the single-host DNS override.
-2. Start the real-cloud relay with the PC LAN IP and the real cloud IP:
+2. Start the real-cloud relay with the PC LAN IP and a non-hijacked DNS resolver:
 
    ```powershell
-   python.exe fakecloud\relay.py --bind 192.168.31.100 --upstream-ip 203.0.113.10
+   python.exe fakecloud\relay.py --bind 192.168.31.100 --upstream-dns 1.1.1.1
    ```
 
-   Replace both example addresses. Raw payloads are not logged by default.
+   Replace the example bind address. Raw payloads are not logged by default.
    `--log-payloads` exists for deliberate local research and may expose secrets.
 
 3. Reconnect or power-cycle only the AC if necessary to make it establish a new
@@ -243,11 +261,38 @@ python.exe controller_cli.py sleepoff
 
 The controller validates mode constraints: temperature requires power on and a
 temperature-capable mode, Fan mode has no temperature or Sleep control, and Dry
-mode fixes fan speed to High.
+mode fixes fan speed to High. Client actions, health checks, and mode changes
+are serialized so they cannot modify shared API and connection state concurrently.
+
+Online health requires both a reachable cloud API and an appliance that reports
+itself connected. Offline recovery initially requires only cloud reachability;
+after switching online, `reconnect_grace_seconds` allows the AC to reconnect.
+The controller also restarts missing or exited relay, replay, and DNS children.
 
 For invisible startup at Windows login, create a Startup shortcut that runs
-`pythonw.exe controller_cli.py run` with `fakecloud/` as its working directory.
-Keep exactly one controller instance running.
+`pythonw.exe controller_cli.py run` using an absolute native Windows script path
+and a native Windows `fakecloud/` working directory. Do not use a WSL UNC path
+for this runtime shortcut. Keep exactly one controller instance running.
+
+## Optional offline rehearsal
+
+Replay compatibility can change if the cloud rotates session material or a
+firmware update changes the protocol. An optional rehearsal can periodically
+verify that the AC acknowledges one selected recorded command before a real
+outage. It does not prove that every command or every future capture will work.
+
+Rehearsal is disabled by default. To enable it, set
+`rehearsal_interval_seconds` to a positive interval and choose a
+`rehearsal_command` present in the command map. Each rehearsal:
+
+1. Stops the real-cloud relay and starts offline replay.
+2. Waits up to `rehearsal_timeout_seconds` for the AC to reconnect.
+3. Sends the selected command and requires its acknowledgment.
+4. Restores online relay mode, including after a failed rehearsal.
+
+This temporarily disconnects ConnectLife and changes the selected AC setting;
+the original setting is not automatically restored. Choose a command whose
+effect is acceptable and do not enable frequent rehearsals.
 
 ## Diagnosis
 
@@ -268,8 +313,9 @@ file contains identifiers and is ignored by Git.
   `fakecloud/config.json` and replace every placeholder.
 - **AC does not reconnect:** confirm the router returns the PC IP only for the
   device-link hostname and that TCP 443/UDP 53 are allowed on the LAN.
-- **Relay loops back to itself:** re-resolve `cloud_upstream_ip` through the
-  normal resolver, not through the override.
+- **Relay loops back to itself:** configure `cloud_upstream_dns` as a resolver
+  outside the hostname override. Check any optional `cloud_upstream_ip` fallback
+  in the same way.
 - **Offline command is unavailable:** record that action in the same complete
   capture and update the command map.
 - **ConnectLife shows the AC offline:** this is expected during standalone
