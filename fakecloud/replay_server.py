@@ -16,6 +16,7 @@ import json
 import socket
 import ssl
 import threading
+import time
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -75,10 +76,12 @@ class ACState:
         self.before_command = None
         self.ack_seq = None
         self.status_revision = 0
+        self.last_tls = None
 
     def attach(self, client):
         with self.condition:
             self.client = client
+            self.last_tls = time.monotonic()
             self.condition.notify_all()
 
     def detach(self, client):
@@ -104,7 +107,10 @@ class ACState:
 
     def snapshot(self):
         with self.condition:
+            age = None if self.last_tls is None else max(0, time.monotonic() - self.last_tls)
             return {"connected": self.client is not None,
+                    "tls_recent": self.client is not None or (age is not None and age <= 90),
+                    "last_tls_age": age,
                     "status": dict(self.status)}
 
     def send_command(self, name):
@@ -171,7 +177,6 @@ def handle_control(connection, state):
 
 def control_listener(state, port):
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", port))
     listener.listen(16)
     log(f"local CLI listening on 127.0.0.1:{port}")

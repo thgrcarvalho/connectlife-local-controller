@@ -229,6 +229,7 @@ class Controller:
             return [
                 sys.executable, str(BASE_DIR / "windows_dns.py"),
                 "--bind", self.config["bind_ip"],
+                "--ac-ip", self.config["ac_ip"],
                 "--upstream", self.config["upstream_dns"],
                 "--hijack", self.config["hijack_domain"],
             ]
@@ -246,6 +247,8 @@ class Controller:
                 "--bind", self.config["bind_ip"],
                 "--ac-ip", self.config["ac_ip"],
                 "--upstream-dns", self.config["cloud_upstream_dns"],
+                "--capture-retention-days", str(self.config.get("capture_retention_days", 0)),
+                "--protect-capture", str(configured_path(self.config["offline_capture"])),
                 "--log-file", str(CAPTURE_DIR / "online-relay.log"),
             ]
             if self.config.get("cloud_upstream_ip"):
@@ -294,7 +297,7 @@ class Controller:
     async def check_relay(self):
         try:
             response = await query_local("status", timeout=2)
-            return bool(response.get("connected"))
+            return bool(response.get("tls_recent", response.get("connected")))
         except (OSError, RuntimeError, asyncio.TimeoutError):
             return False
 

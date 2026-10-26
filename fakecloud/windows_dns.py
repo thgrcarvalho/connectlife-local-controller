@@ -79,11 +79,12 @@ def hijacked_response(packet, answer_ip, domains):
 
 
 class DNSProxy:
-    def __init__(self, bind_ip, answer_ip, upstream, domains):
+    def __init__(self, bind_ip, answer_ip, upstream, domains, ac_ip=None):
         self.bind_ip = bind_ip
         self.answer_ip = answer_ip
         self.upstream = upstream
         self.domains = domains
+        self.ac_ip = ac_ip
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind((bind_ip, 53))
 
@@ -99,7 +100,8 @@ class DNSProxy:
         try:
             name, qtype, _, _ = parse_question(packet)
             log(f"[win-dns] {client[0]} asked type={qtype} {name}")
-            response = hijacked_response(packet, self.answer_ip, self.domains)
+            response = (hijacked_response(packet, self.answer_ip, self.domains)
+                        if self.ac_ip in (None, client[0]) else None)
         except ValueError as error:
             log(f"[win-dns] {client[0]} parse error: {error}; forwarding")
             response = None
@@ -126,8 +128,9 @@ class DNSProxy:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bind", required=True, help="Windows LAN IP")
+    parser.add_argument("--ac-ip", help="only this client receives the hostname override")
     parser.add_argument("--answer", help="IP returned for hijacked names; "
-                        "defaults to --bind (the WSL probe's IP)")
+                        "defaults to --bind")
     parser.add_argument("--upstream", default=None,
                         help="real DNS resolver; default is x.x.x.1 of --bind")
     parser.add_argument("--hijack", default="hijuconn.com",
@@ -138,7 +141,7 @@ def main():
     domains = [item.strip().lower() for item in args.hijack.split(",")
                if item.strip()]
     DNSProxy(args.bind, args.answer or args.bind, upstream,
-             domains).serve_forever()
+             domains, args.ac_ip).serve_forever()
 
 
 if __name__ == "__main__":

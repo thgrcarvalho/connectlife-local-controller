@@ -21,6 +21,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -70,8 +71,9 @@ def pipe(source, destination, direction, connection_id, capture, state):
                 break
             if not data:
                 break
-            capture.write(data)
-            capture.flush()
+            if capture is not None:
+                capture.write(data)
+                capture.flush()
             message = f"[{connection_id:04d}] {direction} {len(data)} bytes"
             if LOG_PAYLOADS:
                 message += f": {payload_text(data)}"
@@ -98,6 +100,30 @@ def pipe(source, destination, direction, connection_id, capture, state):
             pass
 
 
+def cleanup_captures(retention_days, protected, now=None):
+    if retention_days <= 0:
+        return
+    cutoff = (time.time() if now is None else now) - retention_days * 86400
+    protected_files = {
+        base.with_suffix(suffix).resolve()
+        for base in protected for suffix in (".c2s.bin", ".s2c.bin")
+    }
+    for path in CAPTURE_DIR.glob("*.bin"):
+        try:
+            if path.resolve() not in protected_files and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            log(f"capture cleanup failed for {path.name}: {type(error).__name__}")
+
+
+def cleanup_loop(retention_days, protected):
+    while True:
+        cleanup_captures(retention_days, protected)
+        time.sleep(3600)
+
+
 def resolve_upstream(host, dns_server, timeout=5):
     query = DNSRecord.question(host, "A")
     response = DNSRecord.parse(query.send(dns_server, 53, timeout=timeout))
@@ -119,6 +145,9 @@ def handle_client(raw_client, address, server_context, args, state):
 
     log(f"[{connection_id:04d}] {peer} client TLS OK: "
         f"{client.version()} {client.cipher()[0]}")
+    is_target = getattr(args, "ac_ip", None) in (None, address[0])
+    connection_state = state if is_target else ACState({})
+    connection_state.attach(client)
     try:
         upstream_ip = args.upstream_ip
         if args.upstream_dns:
@@ -139,19 +168,20 @@ def handle_client(raw_client, address, server_context, args, state):
             f"{args.upstream_host} ({upstream_ip}) via {upstream.version()}")
     except (OSError, ssl.SSLError) as error:
         log(f"[{connection_id:04d}] upstream connection failed: {error}")
+        connection_state.detach(client)
         client.close()
         return
 
     CAPTURE_DIR.mkdir(exist_ok=True)
     capture_base = CAPTURE_DIR / (
         f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{connection_id:04d}")
-    c2s_file = capture_base.with_suffix(".c2s.bin").open("ab")
-    s2c_file = capture_base.with_suffix(".s2c.bin").open("ab")
-    log(f"[{connection_id:04d}] capturing to {capture_base}.*.bin")
-    connection_state = (state if getattr(args, "ac_ip", None) in (None, address[0])
-                        else ACState({}))
+    c2s_file = None
+    s2c_file = None
+    if is_target:
+        c2s_file = capture_base.with_suffix(".c2s.bin").open("ab")
+        s2c_file = capture_base.with_suffix(".s2c.bin").open("ab")
+        log(f"[{connection_id:04d}] capturing to {capture_base}.*.bin")
     connection_state.capture = s2c_file
-    connection_state.attach(client)
 
     downstream = threading.Thread(
         target=pipe, args=(upstream, client, "cloud -> AC", connection_id, s2c_file,
@@ -162,6 +192,8 @@ def handle_client(raw_client, address, server_context, args, state):
 
     connection_state.detach(client)
     for stream in (client, upstream, c2s_file, s2c_file):
+        if stream is None:
+            continue
         try:
             stream.close()
         except OSError:
@@ -212,6 +244,10 @@ def main():
                         help="capture basename for optional command injection")
     parser.add_argument("--command-map", type=Path,
                         help="JSON object mapping command names to capture indices")
+    parser.add_argument("--capture-retention-days", type=int, default=0,
+                        help="delete old capture binaries; 0 disables retention")
+    parser.add_argument("--protect-capture", type=Path, action="append", default=[],
+                        help="capture basename to preserve, repeatable")
     parser.add_argument("--control-port", type=int, default=8765)
     parser.add_argument("--log-file", type=Path, default=LOG_FILE)
     parser.add_argument("--log-payloads", action="store_true",
@@ -219,6 +255,8 @@ def main():
     args = parser.parse_args()
     if not args.upstream_dns and not args.upstream_ip:
         parser.error("either --upstream-dns or --upstream-ip is required")
+    if args.capture_retention_days < 0:
+        parser.error("--capture-retention-days cannot be negative")
     LOG_FILE = args.log_file
     LOG_PAYLOADS = args.log_payloads
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +271,10 @@ def main():
     state = ACState(command_frames)
     threading.Thread(target=control_listener, args=(state, args.control_port),
                      daemon=True).start()
+    if args.capture_retention_days:
+        threading.Thread(target=cleanup_loop,
+                         args=(args.capture_retention_days, args.protect_capture),
+                         daemon=True).start()
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1

@@ -11,8 +11,11 @@ own AC. The capture procedure is reusable; the captured bytes are not.
 ## Features
 
 - Online control through the ConnectLife API.
-- Health checks for cloud reachability, appliance connectivity, and the relay's
-  local AC connection, with no replay flapping while the AC is absent.
+- Health checks for cloud reachability, appliance connectivity, and recent
+  target-AC TLS activity, including partial device-link outages where the
+  upstream connection cannot be established.
+- Target-only DNS interception and capture, leaving other LAN devices alone.
+- Bounded capture retention with explicit protection for the offline session.
 - Automatic fallback to local replay after three actionable online health failures.
 - Automatic return to online mode after two successful cloud checks, with time
   for the appliance to reconnect before its connectivity is enforced again.
@@ -116,6 +119,9 @@ Configuration fields:
 - `hijack_domain`: normally `ac-eu-link.hijuconn.com`.
 - `offline_capture`: capture basename, without `.c2s.bin` or `.s2c.bin`.
 - `command_map`: JSON file mapping action names to captured command indices.
+- `capture_retention_days`: age limit for old capture binaries; `0` disables
+  cleanup. The configured `offline_capture` is always protected. Non-target
+  devices are not captured when `ac_ip` is set.
 - `reconnect_grace_seconds`: time allowed for the AC to reconnect after entering
   online mode before appliance disconnects count as failed health checks.
 - `local_control_retry_seconds`: deadline for replay's localhost control service
@@ -133,30 +139,81 @@ by Git. `AC_LOCAL_CONFIG` can point to a configuration in another location.
 
 ## Router DNS configuration
 
-Override **only** `ac-eu-link.hijuconn.com`, pointing it to the PC. Leave the
-router's WAN DNS automatic. Do not point the whole network's DNS at the PC;
-other devices would lose DNS whenever the PC is off.
+Give **only the target AC** the PC as its DHCP DNS server. The Windows proxy
+returns the synthetic device-link address only to `ac_ip` and forwards all other
+queries normally. Do not create a LAN-wide hostname override: another
+ConnectLife device may reject the local certificate. Leave WAN DNS automatic.
 
-For routers using OpenWrt-style UCI, the persistent configuration is:
+For routers using OpenWrt-style UCI, reserve the AC address and tag its DHCP
+options. Replace the example MAC and addresses:
 
 ```uci
-config domain
-    option name 'ac-eu-link.hijuconn.com'
-    option ip '192.168.31.100'
+config host
+    option name 'target-ac'
+    option mac 'aa:bb:cc:dd:ee:ff'
+    option ip '192.168.31.101'
+    option tag 'ac_dns'
+
+config tag 'ac_dns'
+    option dhcp_option '6,192.168.31.100'
 ```
 
-Replace the example IP with the PC's actual LAN IP. Apply the configuration and
-restart the router's DNS service. A `/etc/hosts` or `/etc/custom_hosts` entry
-may be temporary on some stock firmware and is not a substitute for verifying
-persistence. Reboot the router and confirm both of these results:
+Here `192.168.31.101` is the AC and `192.168.31.100` is the PC. Remove any
+existing global `config domain` entry for `ac-eu-link.hijuconn.com`. Apply the
+configuration, restart the router's DHCP/DNS service, and renew the AC's DHCP
+lease if necessary. Reboot the router and confirm persistence. Router DNS must
+return real public addresses for both the device-link hostname and ordinary
+names; only the AC receives the PC proxy through DHCP.
 
-```sh
-nslookup ac-eu-link.hijuconn.com 192.168.31.1  # returns the PC IP
-nslookup example.com 192.168.31.1              # returns normal public addresses
+On other routers, use the equivalent per-client DHCP DNS option. If per-client
+DNS is unavailable, do not apply the override to other ConnectLife devices.
+
+### Stock firmware without per-client DHCP options
+
+Some Xiaomi stock firmware records DHCP tags but does not generate the options.
+A router-local secondary DNS responder avoids that limitation and also avoids a
+source-address mismatch in redirected replies. It replaces the Windows DNS proxy
+for this route. For example, run a second `dnsmasq` on router port 5354 with a
+persistent configuration such as:
+
+```text
+port=5354
+no-resolv
+server=192.168.1.1
+listen-address=192.168.31.1
+bind-interfaces
+address=/ac-eu-link.hijuconn.com/192.168.31.100
+pid-file=/tmp/ac-local-dnsmasq.pid
 ```
 
-Replace `192.168.31.1` with the router's address. On other routers, use the
-corresponding static-DNS/dnsmasq hostname override.
+Use the router's normal upstream resolver and replace the PC/router example
+addresses. Redirect only the target AC's DNS traffic to this local responder:
+
+```uci
+config redirect 'ac_dns_udp'
+    option name 'AC-DNS-UDP'
+    option src 'lan'
+    option dest 'lan'
+    option proto 'udp'
+    option src_ip '192.168.31.101'
+    option src_dport '53'
+    option dest_ip '192.168.31.1'
+    option dest_port '5354'
+    option target 'DNAT'
+```
+
+Add the corresponding TCP rule. Remove any global device-link domain override
+and do not add source NAT for this router-local destination. Persist the
+secondary service in `/data` and start it through a firewall include, which the
+tested Xiaomi firmware runs at boot and on every firewall restart:
+
+```uci
+config include 'ac_local_dns'
+    option path '/data/ac-local-dns.sh'
+    option type 'script'
+```
+
+Reboot the router and verify both service persistence and ordinary LAN DNS.
 
 The relay resolves the real cloud hostname through `cloud_upstream_dns` on each
 new upstream connection. This resolver must be outside the hostname override.
@@ -168,14 +225,14 @@ Captures can contain session tokens, device identifiers, status data, and
 signed commands. Keep them private. The `fakecloud/captures/` directory is
 ignored by Git.
 
-1. Generate the certificate and configure the single-host DNS override.
-2. Start the real-cloud relay with the PC LAN IP and a non-hijacked DNS resolver:
+1. Generate the certificate and configure a target-only DNS path.
+2. Start the real-cloud relay with the PC and AC LAN IPs plus a non-hijacked resolver:
 
    ```powershell
-   python.exe fakecloud\relay.py --bind 192.168.31.100 --upstream-dns 1.1.1.1
+   python.exe fakecloud\relay.py --bind 192.168.31.100 --ac-ip 192.168.31.101 --upstream-dns 1.1.1.1
    ```
 
-   Replace the example bind address. Raw payloads are not logged by default.
+   Replace the example addresses. Raw payloads are not logged by default.
    `--log-payloads` exists for deliberate local research and may expose secrets.
 
 3. Reconnect or power-cycle only the AC if necessary to make it establish a new
@@ -278,13 +335,16 @@ whose clients disconnect while queued are discarded before execution.
 
 Cloud API failures can trigger offline replay whether or not the AC is present.
 If the API is reachable but reports the appliance offline, the controller checks
-the relay's localhost status for `ac_ip`; other devices using the relay have
-isolated state and cannot affect this decision. A live relay-to-AC connection
-makes replay useful; no local connection means the AC is absent, so the
-controller waits instead of flapping between modes. Offline recovery initially requires only cloud
-reachability; after switching online, `reconnect_grace_seconds` allows the AC to
-reconnect. The controller restarts missing or exited relay, replay, and DNS
-children with bounded exponential backoff after repeated failures.
+recent target-AC TLS activity reported by the relay. The relay records this
+activity before attempting the Hisense upstream connection, so a partial
+device-link outage remains visible. The history expires after 90 seconds without
+an active connection or new handshake, avoiding perpetual failover while the AC
+is absent. Other devices
+have isolated state and cannot affect this decision. Offline recovery initially
+requires only cloud reachability; after switching online,
+`reconnect_grace_seconds` allows the AC to reconnect. The controller restarts
+missing or exited relay, replay, and DNS children with bounded exponential
+backoff after repeated failures.
 
 For invisible startup at Windows login, create a Startup shortcut that runs
 `pythonw.exe controller_cli.py run` using an absolute native Windows script path
@@ -328,8 +388,8 @@ file contains identifiers and is ignored by Git.
 
 - **Missing configuration:** copy `config.example.json` to
   `fakecloud/config.json` and replace every placeholder.
-- **AC does not reconnect:** confirm the router returns the PC IP only for the
-  device-link hostname and that TCP 443/UDP 53 are allowed on the LAN.
+- **AC does not reconnect:** confirm its DHCP lease supplies the PC as DNS, the
+  proxy accepts its `ac_ip`, and TCP 443/UDP 53 are allowed on the LAN.
 - **Relay loops back to itself:** configure `cloud_upstream_dns` as a resolver
   outside the hostname override. Check any optional `cloud_upstream_ip` fallback
   in the same way.
@@ -337,11 +397,12 @@ file contains identifiers and is ignored by Git.
   capture and update the command map.
 - **ConnectLife shows the AC offline:** this is expected during standalone
   replay; return to online mode for simultaneous app/cloud access.
-- **DNS fails when the PC is off:** the router is still using the PC as its
-  global DNS server. Restore automatic WAN DNS and keep only the hostname
-  override.
-- **After a router reboot:** verify that the override persists. A temporary
-  hosts file may be regenerated or deleted by stock firmware.
+- **Another device has certificate errors:** remove any LAN-wide hostname
+  override and use only the per-AC DNS configuration.
+- **DNS fails when the PC is off:** only the target AC should use the PC relay.
+  Other clients must receive normal DNS from the router, with WAN DNS automatic.
+- **After a router reboot:** verify that the per-client DNS rule and any
+  router-local responder persist.
 
 ## Security and limitations
 
