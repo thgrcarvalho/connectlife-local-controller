@@ -308,6 +308,20 @@ class Controller:
         except (OSError, RuntimeError, asyncio.TimeoutError):
             return {"tls_recent": False, "last_tls_age": None}
 
+    def router_warning_message(self):
+        return ("Cloud reports the AC online, but no target AC TLS activity was seen "
+                f"within the configured {int(self.router_warning_seconds)}-second "
+                "router-path interval")
+
+    def active_warnings(self):
+        if self.mode != "online" or not self.router_warning_active:
+            return []
+        return [{
+            "code": "router_path_unavailable",
+            "severity": "warning",
+            "message": self.router_warning_message(),
+        }]
+
     def update_router_warning(self, cloud_reachable, appliance_connected, relay_status, now):
         recent = relay_status["tls_recent"]
         age = relay_status["last_tls_age"]
@@ -323,8 +337,7 @@ class Controller:
                 self.no_tls_since = now
             expired = now - self.no_tls_since >= self.router_warning_seconds
         if expired and not self.router_warning_active:
-            self.log("router path warning: cloud reports AC online, but no target "
-                     "AC TLS activity has been seen for over an hour")
+            self.log(self.router_warning_message())
             self.router_warning_active = True
 
     def update_health(self, cloud_reachable, appliance_connected, relay_connected, now):
@@ -435,7 +448,8 @@ class Controller:
             status = filtered_status(response.get("status", {}))
             connected = response.get("connected", False)
         self.last_status = status
-        return {"connected": connected, "status": status}
+        return {"connected": connected, "status": status,
+                "warnings": self.active_warnings()}
 
     def validate_action(self, action, status):
         if action.startswith("temp") and (

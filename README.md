@@ -182,15 +182,17 @@ persistent configuration such as:
 ```text
 port=5354
 no-resolv
-server=192.168.1.1
+server=127.0.0.1
 listen-address=192.168.31.1
 bind-interfaces
 address=/ac-eu-link.hijuconn.com/192.168.31.100
 pid-file=/tmp/ac-local-dnsmasq.pid
 ```
 
-Use the router's normal upstream resolver and replace the PC/router example
-addresses. Redirect only the target AC's DNS traffic to this local responder:
+`127.0.0.1` selects the router's main resolver on port 53, inheriting its current
+WAN DNS settings without forwarding the secondary responder to itself. Replace
+the PC/router example addresses and redirect only the target AC's DNS traffic to
+this local responder:
 
 ```uci
 config redirect 'ac_dns_udp'
@@ -388,6 +390,18 @@ mode fixes fan speed to High. Client actions, health checks, and mode changes
 are serialized so they cannot modify shared API and connection state concurrently.
 A server-side 30-second deadline covers both lock waiting and execution. Requests
 whose clients disconnect while queued are discarded before execution.
+
+Status responses include a `warnings` list for frontends. It is empty during
+normal operation. An active router-path warning has this shape and clears after
+recovery:
+
+```json
+{
+  "code": "router_path_unavailable",
+  "severity": "warning",
+  "message": "Cloud reports the AC online, but no target AC TLS activity was seen within the configured 3600-second router-path interval"
+}
+```
 
 Cloud API failures can trigger offline replay whether or not the AC is present.
 If the API is reachable but reports the appliance offline, the controller checks
