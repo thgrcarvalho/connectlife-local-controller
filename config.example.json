@@ -12,6 +12,7 @@
   "local_control_retry_seconds": 10,
   "health_interval_seconds": 30,
   "health_retry_seconds": 5,
+  "router_path_warning_seconds": 3600,
   "rehearsal_interval_seconds": 0,
   "rehearsal_timeout_seconds": 60,
   "rehearsal_command": "sleepoff"

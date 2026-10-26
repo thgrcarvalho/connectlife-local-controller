@@ -129,6 +129,9 @@ Configuration fields:
 - `health_interval_seconds`: cloud polling interval while healthy; defaults to 30.
 - `health_retry_seconds`: polling interval during failures and offline recovery;
   defaults to 5. Child supervision continues every five seconds independently.
+- `router_path_warning_seconds`: log a warning when the cloud reports the AC
+  online but no target TLS activity is seen for this long; defaults to 3600.
+  This does not change modes or commands. `0` disables the warning.
 - `rehearsal_interval_seconds`: optional offline rehearsal interval; `0` disables
   rehearsal. See the rehearsal section before enabling it.
 - `rehearsal_timeout_seconds` and `rehearsal_command`: reconnect deadline and the
@@ -213,7 +216,60 @@ config include 'ac_local_dns'
     option type 'script'
 ```
 
-Reboot the router and verify both service persistence and ordinary LAN DNS.
+Use this exact `/data/ac-local-dns.sh` startup script:
+
+```sh
+#!/bin/sh
+if [ -f /tmp/ac-local-dnsmasq.pid ] && kill -0 "$(cat /tmp/ac-local-dnsmasq.pid)" 2>/dev/null; then
+    exit 0
+fi
+exec dnsmasq --conf-file=/data/ac-local-dnsmasq.conf
+```
+
+After creating the configuration and script, apply the UCI sections shown above,
+then enable and start the service:
+
+```sh
+chmod 700 /data/ac-local-dns.sh
+uci set firewall.ac_local_dns=include
+uci set firewall.ac_local_dns.path=/data/ac-local-dns.sh
+uci set firewall.ac_local_dns.type=script
+uci commit dhcp
+uci commit firewall
+/data/ac-local-dns.sh
+/etc/init.d/firewall restart
+```
+
+Verify the process, listener, redirect, and ordinary router DNS:
+
+```sh
+kill -0 "$(cat /tmp/ac-local-dnsmasq.pid)"
+netstat -lntu | grep 5354
+iptables -t nat -S | grep 5354
+nslookup www.google.com 192.168.31.1
+```
+
+Reboot the router and repeat those checks. The AC should then appear in the
+relay log and report `tls_recent=true` through the localhost relay status.
+
+To remove the custom path and restore direct-cloud DNS, run:
+
+```sh
+uci delete firewall.ac_dns_udp
+uci delete firewall.ac_dns_tcp
+uci delete firewall.ac_local_dns
+uci commit firewall
+/etc/init.d/firewall restart
+kill "$(cat /tmp/ac-local-dnsmasq.pid)"
+rm -f /data/ac-local-dnsmasq.conf /data/ac-local-dns.sh
+rm -f /tmp/ac-local-dnsmasq.pid
+```
+
+Keep a copy of the exact `/data` files and target UCI sections outside the
+router. A factory reset or firmware update can remove `/data`; restore those
+artifacts and repeat verification rather than recreating a global override.
+While the cloud reports the AC online, `router_path_warning_seconds` makes a
+missing relay path visible in the controller log.
 
 The relay resolves the real cloud hostname through `cloud_upstream_dns` on each
 new upstream connection. This resolver must be outside the hostname override.

@@ -140,6 +140,9 @@ class Controller:
         self.local_control_retry = float(config.get("local_control_retry_seconds", 10))
         self.health_interval = float(config.get("health_interval_seconds", 30))
         self.health_retry_interval = float(config.get("health_retry_seconds", 5))
+        self.router_warning_seconds = float(config.get("router_path_warning_seconds", 3600))
+        self.no_tls_since = None
+        self.router_warning_active = False
         self.rehearsal_interval = float(config.get("rehearsal_interval_seconds", 0))
         self.rehearsal_timeout = float(config.get("rehearsal_timeout_seconds", 60))
         self.rehearsal_command = config.get("rehearsal_command", "sleepoff")
@@ -147,8 +150,9 @@ class Controller:
         self.process_started_at = {}
         self.process_start_attempts = {}
         self.process_retry_after = {}
-        if self.reconnect_grace < 0 or self.rehearsal_interval < 0:
-            raise ValueError("reconnect and rehearsal intervals cannot be negative")
+        if min(self.reconnect_grace, self.rehearsal_interval,
+               self.router_warning_seconds) < 0:
+            raise ValueError("reconnect, rehearsal, and warning intervals cannot be negative")
         if min(self.local_control_retry, self.health_interval,
                self.health_retry_interval, self.rehearsal_timeout) <= 0:
             raise ValueError("retry, health, and rehearsal timeouts must be positive")
@@ -297,9 +301,31 @@ class Controller:
     async def check_relay(self):
         try:
             response = await query_local("status", timeout=2)
-            return bool(response.get("tls_recent", response.get("connected")))
+            return {
+                "tls_recent": bool(response.get("tls_recent", response.get("connected"))),
+                "last_tls_age": response.get("last_tls_age"),
+            }
         except (OSError, RuntimeError, asyncio.TimeoutError):
-            return False
+            return {"tls_recent": False, "last_tls_age": None}
+
+    def update_router_warning(self, cloud_reachable, appliance_connected, relay_status, now):
+        recent = relay_status["tls_recent"]
+        age = relay_status["last_tls_age"]
+        if (not self.router_warning_seconds or self.mode != "online"
+                or not cloud_reachable or not appliance_connected or recent):
+            self.no_tls_since = None
+            self.router_warning_active = False
+            return
+        if age is not None:
+            expired = age >= self.router_warning_seconds
+        else:
+            if self.no_tls_since is None:
+                self.no_tls_since = now
+            expired = now - self.no_tls_since >= self.router_warning_seconds
+        if expired and not self.router_warning_active:
+            self.log("router path warning: cloud reports AC online, but no target "
+                     "AC TLS activity has been seen for over an hour")
+            self.router_warning_active = True
 
     def update_health(self, cloud_reachable, appliance_connected, relay_connected, now):
         if self.mode == "online":
@@ -374,11 +400,15 @@ class Controller:
                     self.supervise_processes()
                     now = loop.time()
                     if now >= next_health_check:
-                        relay_connected = await self.check_relay() if self.mode == "online" else False
+                        relay_status = (await self.check_relay() if self.mode == "online"
+                                        else {"tls_recent": False, "last_tls_age": None})
                         cloud_reachable, appliance_connected = await self.check_cloud()
                         now = loop.time()
                         self.update_health(
-                            cloud_reachable, appliance_connected, relay_connected, now)
+                            cloud_reachable, appliance_connected,
+                            relay_status["tls_recent"], now)
+                        self.update_router_warning(
+                            cloud_reachable, appliance_connected, relay_status, now)
                         if (self.mode == "online" and cloud_reachable
                                 and appliance_connected and self.rehearsal_due(now)):
                             await self.rehearse_offline()
