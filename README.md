@@ -421,6 +421,72 @@ For invisible startup at Windows login, create a Startup shortcut that runs
 and a native Windows `fakecloud/` working directory. Do not use a WSL UNC path
 for this runtime shortcut. Keep exactly one controller instance running.
 
+## Local HTTP and WebSocket API
+
+Besides the line-based control socket, the controller serves a small JSON API
+for frontends. It binds to `api_host`:`api_port` (default `127.0.0.1:8767`).
+Keep it on the loopback address unless every host on that network may control
+the AC; there is no authentication.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /api/status` | Last known snapshot. Add `?refresh=1` to query the AC first. |
+| `GET /api/actions` | Control actions and the properties each one sets. |
+| `POST /api/actions/<action>` | Run one action; returns the refreshed snapshot. |
+| `GET /api/events` | WebSocket. Sends the snapshot on connect and on every change; the text frame `refresh` requests a new reading. |
+
+A snapshot has the shape below. `updated_at` is a Unix timestamp of the last
+successful reading and `error` is the last controller-side problem, or `null`.
+
+```json
+{
+  "mode": "online",
+  "connected": true,
+  "status": {"t_power": "1", "t_work_mode": "2", "t_temp": "22", "f_temp_in": "24"},
+  "warnings": [],
+  "error": null,
+  "updated_at": 1793065709.0
+}
+```
+
+Online, the relay decodes the status frames the AC sends to the cloud, so
+changes made from the remote or the phone app reach the snapshot within about
+two seconds; the cloud health check (`health_interval_seconds`) and each action
+refresh it as well. After a command the controller waits up to six seconds for
+the cloud to echo the sent values and otherwise keeps them as pending for
+`pending_confirmation_seconds`, because the cloud can report stale values for a
+while. Offline, the snapshot refreshes from the replay server every two seconds. Rejected actions return HTTP 409 with the reason, timeouts 504, and
+cloud or local failures 502, always with `ok: false` and the current snapshot.
+
+## Desktop tray app
+
+`desktop/` contains a Windows tray remote built with Electron that uses only the
+API above. Clicking the tray icon opens a popup with the room temperature, the
+target, mode, fan speed, sleep, and power. The icon colour follows the AC: grey
+when off, blue when running, amber while a warning is active, dark grey when the
+controller or the AC is unreachable. Settings live in
+`%APPDATA%\AC Tray\settings.json` (the app log `renderer.log` sits beside it):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `apiUrl` | `http://127.0.0.1:8767` | Controller API address. |
+| `controllerDir` | `%LOCALAPPDATA%\ConnectLifeLocalController\fakecloud` | Native copy of `fakecloud/`. |
+| `startController` | `true` | Start `pythonw.exe controller_cli.py run` from `controllerDir` when the API is not reachable after ten seconds. |
+| `openAtLogin` | `true` | Register the packaged app to start at Windows login. |
+
+Build on Windows with Node.js 20 or newer:
+
+```powershell
+cd desktop
+npm install
+npm run build        # dist\win-unpacked\AC Tray.exe
+```
+
+Run `AC Tray.exe` once; it registers itself to start at login when
+`openAtLogin` is true, and starts the controller itself when needed, so the
+`pythonw.exe` Startup shortcut becomes optional. `npm start` runs the app from
+source and `--show` opens the popup immediately.
+
 ## Optional offline rehearsal
 
 Replay compatibility can change if the cloud rotates session material or a
@@ -444,7 +510,10 @@ effect is acceptable and do not enable frequent rehearsals.
 ## Diagnosis
 
 Online diagnosis uses ConnectLife's self-check API and reports the entries in
-`selfCheckFailedList`. Offline diagnosis evaluates live fault flags for:
+`selfCheckFailedList`. Offline diagnosis evaluates live fault flags. Both return
+the same shape: `normal`, the raw `failed` keys, and `categories` with the three
+groups the ConnectLife app shows (Sensors, Communications, Others), each listing
+its fault labels or staying empty. The faults covered are:
 
 - Indoor room and coil temperature sensors.
 - Indoor/outdoor communication.
