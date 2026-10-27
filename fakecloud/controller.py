@@ -17,6 +17,7 @@ if WINDOWS_DEPS.is_dir():
 from connectlife.api import ConnectLifeApi
 
 from credential_store import load_credentials
+from api_server import ApiServer, DEFAULT_API_HOST, DEFAULT_API_PORT
 CAPTURE_DIR = BASE_DIR / "captures"
 CONTROL_PORT = 8766
 ACTION_TIMEOUT = 30
@@ -134,6 +135,14 @@ class Controller:
         self.processes = {}
         self.running = True
         self.last_status = {}
+        self.last_connected = False
+        self.last_error = None
+        self.last_update = None
+        self.pending = {}
+        self.pending_seconds = float(config.get("pending_confirmation_seconds", 90))
+        self.api_server = ApiServer(
+            self, config.get("api_host", DEFAULT_API_HOST),
+            int(config.get("api_port", DEFAULT_API_PORT)))
         self.action_lock = asyncio.Lock()
         self.online_grace_until = 0
         self.reconnect_grace = float(config.get("reconnect_grace_seconds", 60))
@@ -177,7 +186,9 @@ class Controller:
         attempt = self.process_start_attempts.get(name, 0)
         self.log(f"starting {name}")
         try:
-            with SUBPROCESS_LOG.open("a", encoding="utf-8") as stream:
+            # Each child gets its own file: a child sharing the controller's log
+            # handle inherits its file pointer and overwrites the controller's lines.
+            with (CAPTURE_DIR / f"{name}-process.log").open("a", encoding="utf-8") as stream:
                 self.processes[name] = subprocess.Popen(
                     arguments, cwd=BASE_DIR, stdout=stream, stderr=subprocess.STDOUT,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -276,6 +287,7 @@ class Controller:
         self.cloud_successes = 0
         if mode == "online":
             self.online_grace_until = asyncio.get_running_loop().time() + self.reconnect_grace
+        self.publish()
 
     async def cloud_request(self, callback):
         test_file = CAPTURE_DIR / "controller-test-server.txt"
@@ -293,10 +305,86 @@ class Controller:
                 raise RuntimeError("no appliances returned")
             self.puid = devices[0]["puid"]
             connected = devices[0].get("offlineState") in (1, "1")
+            if self.mode == "online":
+                self.record_status(connected, filtered_status(devices[0].get("statusList", {})))
             return True, connected
         except Exception as error:
             self.log(f"cloud health check failed: {type(error).__name__}")
+            if self.mode == "online":
+                self.record_error(f"cloud unreachable ({type(error).__name__})")
             return False, False
+
+    async def refresh_local_status(self):
+        try:
+            response = await query_local("status", timeout=3)
+        except (OSError, RuntimeError, asyncio.TimeoutError) as error:
+            self.record_error(f"local control unavailable ({type(error).__name__})")
+            return
+        self.record_status(response.get("connected", False),
+                           filtered_status(response.get("status", {})))
+
+    async def merge_relay_status(self):
+        # Online, the relay decodes the status frames the AC sends to the cloud,
+        # so changes made from the remote or the phone app show up without
+        # waiting for the next cloud read.
+        try:
+            response = await query_local("status", timeout=3)
+        except (OSError, RuntimeError, asyncio.TimeoutError):
+            return
+        status = filtered_status(response.get("status", {}))
+        if not status:
+            return
+        merged = {**self.last_status, **status}
+        connected = bool(response.get("connected"))
+        if merged != self.last_status or connected != self.last_connected:
+            self.record_status(connected, merged)
+
+    def record_status(self, connected, status):
+        self.last_status = self.overlay_pending(status)
+        self.last_connected = bool(connected)
+        self.last_error = None
+        self.last_update = time.time()
+        self.publish()
+
+    def overlay_pending(self, status):
+        # The cloud can echo pre-command values for a while. Until it agrees or the
+        # pending window expires, readings keep the values the controller sent.
+        now = time.monotonic()
+        merged = dict(status)
+        for key, (value, expires_at) in list(self.pending.items()):
+            if status.get(key) == value or now >= expires_at:
+                del self.pending[key]
+                continue
+            merged[key] = value
+        return merged
+
+    def record_error(self, message):
+        self.last_error = message
+        self.publish()
+
+    @property
+    def snapshot(self):
+        return {
+            "mode": self.mode,
+            "connected": self.last_connected,
+            "status": dict(self.last_status),
+            "warnings": self.active_warnings(),
+            "error": self.last_error,
+            "updated_at": self.last_update,
+        }
+
+    def publish(self):
+        self.api_server.publish(self.snapshot)
+
+    def allowed_actions(self):
+        return ALLOWED_ACTIONS
+
+    def action_catalog(self):
+        return {action: properties for action, properties in ACTION_PROPERTIES.items()}
+
+    async def run_action(self, action):
+        async with self.action_lock:
+            return await asyncio.wait_for(self.handle_action(action), timeout=ACTION_TIMEOUT)
 
     async def check_relay(self):
         try:
@@ -328,7 +416,9 @@ class Controller:
         if (not self.router_warning_seconds or self.mode != "online"
                 or not cloud_reachable or not appliance_connected or recent):
             self.no_tls_since = None
-            self.router_warning_active = False
+            if self.router_warning_active:
+                self.router_warning_active = False
+                self.publish()
             return
         if age is not None:
             expired = age >= self.router_warning_seconds
@@ -339,6 +429,7 @@ class Controller:
         if expired and not self.router_warning_active:
             self.log(self.router_warning_message())
             self.router_warning_active = True
+            self.publish()
 
     def update_health(self, cloud_reachable, appliance_connected, relay_connected, now):
         if self.mode == "online":
@@ -408,10 +499,16 @@ class Controller:
             server = await asyncio.start_server(
                 self.handle_connection, "127.0.0.1", CONTROL_PORT)
             self.log(f"controller listening on 127.0.0.1:{CONTROL_PORT}")
+            await self.api_server.start()
             while self.running:
                 async with self.action_lock:
                     self.supervise_processes()
                     now = loop.time()
+                    if self.processes_ready():
+                        if self.mode == "offline":
+                            await self.refresh_local_status()
+                        else:
+                            await self.merge_relay_status()
                     if now >= next_health_check:
                         relay_status = (await self.check_relay() if self.mode == "online"
                                         else {"tls_recent": False, "last_tls_age": None})
@@ -429,14 +526,15 @@ class Controller:
                                     if self.mode == "offline" or self.cloud_failures
                                     else self.health_interval)
                         next_health_check = loop.time() + interval
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
         finally:
+            await self.api_server.stop()
             if server is not None:
                 server.close()
                 await server.wait_closed()
             self.stop_all()
 
-    async def get_status(self):
+    async def fetch_status(self):
         if self.mode == "online":
             devices = await self.cloud_request(lambda: self.api.get_appliances_json())
             if not devices:
@@ -447,7 +545,11 @@ class Controller:
             response = await query_local_with_retry("status", self.local_control_retry)
             status = filtered_status(response.get("status", {}))
             connected = response.get("connected", False)
-        self.last_status = status
+        return connected, status
+
+    async def get_status(self):
+        connected, status = await self.fetch_status()
+        self.record_status(connected, status)
         return {"connected": connected, "status": status,
                 "warnings": self.active_warnings()}
 
@@ -470,9 +572,23 @@ class Controller:
         self.validate_action(action, current["status"])
         if self.mode == "online":
             await self.cloud_request(lambda: self.api.update_appliance(self.puid, properties))
-            await asyncio.sleep(1)
-            return await self.get_status()
-        return await query_local(action)
+        else:
+            await query_local(action)
+        # The cloud echoes the old values for a few seconds after a command, so
+        # poll until it reflects the sent properties before publishing a reading.
+        for delay in (1, 2, 3):
+            await asyncio.sleep(delay)
+            connected, status = await self.fetch_status()
+            if all(status.get(key) == value for key, value in properties.items()):
+                self.record_status(connected, status)
+                return {"connected": connected, "status": status,
+                        "warnings": self.active_warnings()}
+        self.log(f"{action} not yet reflected by the status source; assuming it applied")
+        expires_at = time.monotonic() + self.pending_seconds
+        self.pending.update({key: (value, expires_at) for key, value in properties.items()})
+        self.record_status(connected, status)
+        return {"connected": connected, "status": self.last_status,
+                "warnings": self.active_warnings()}
 
     async def get_diagnostics(self):
         if self.mode == "offline":
@@ -480,12 +596,14 @@ class Controller:
             return diagnostic_summary(current["status"])
         response = await self.cloud_request(lambda: self.api.get_self_check(self.puid))
         data = response.get("data", {})
-        failed = data.get("selfCheckFailedList", [])
-        result = {"normal": not failed, "failed": []}
-        for item in failed:
-            if isinstance(item, dict) and "statusKey" in item:
-                result["failed"].append(item["statusKey"])
-        return result
+        failed = [item["statusKey"] for item in data.get("selfCheckFailedList", [])
+                  if isinstance(item, dict) and "statusKey" in item]
+        labels = {key: (category, label) for key, category, label in DIAGNOSTIC_RULES}
+        categories = {"Sensors": [], "Communications": [], "Others": []}
+        for key in failed:
+            category, label = labels.get(key, ("Others", key))
+            categories[category].append(label)
+        return {"normal": not failed, "failed": failed, "categories": categories}
 
     async def run_client_action(self, action, reader):
         async with self.action_lock:
