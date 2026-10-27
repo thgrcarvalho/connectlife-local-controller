@@ -1,0 +1,25 @@
+{
+  "name": "connectlife-local-tray",
+  "productName": "AC Tray",
+  "version": "0.1.0",
+  "description": "Windows tray remote for the ConnectLife local controller",
+  "main": "main.js",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win dir",
+    "build:portable": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "33.4.11",
+    "electron-builder": "25.1.8"
+  },
+  "build": {
+    "appId": "dev.thgrcarvalho.connectlife-local-tray",
+    "productName": "AC Tray",
+    "directories": { "output": "dist" },
+    "files": ["main.js", "preload.js", "renderer/**", "assets/**", "package.json"],
+    "win": { "icon": "assets/icon.png", "target": ["dir"] }
+  }
+}

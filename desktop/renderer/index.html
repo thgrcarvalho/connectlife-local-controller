@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; style-src 'self'; img-src 'self' data:">
+  <title>AC Tray</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app" class="app" data-state="connecting">
+    <header class="top">
+      <div class="path" id="path">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="path-label">Connecting</span>
+        <span class="power-state" aria-hidden="true"></span>
+      </div>
+      <button class="chip" id="sleep" type="button" aria-pressed="false" title="Sleep mode">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <path d="M10.5 2a6 6 0 1 0 3.5 10.5A7 7 0 0 1 10.5 2z" fill="currentColor"/>
+        </svg>
+        <span>Sleep</span>
+      </button>
+    </header>
+
+    <section class="room" aria-live="polite">
+      <div class="room-temp"><span id="room-temp">--</span><span class="deg">°</span></div>
+      <div class="room-label">in the room</div>
+    </section>
+
+    <section class="dial" aria-label="Target temperature">
+      <div class="ribbon" id="ribbon" role="slider" tabindex="0" aria-label="Target temperature" aria-valuemin="16" aria-valuemax="30">
+        <div class="ribbon-track"></div>
+        <div class="ribbon-span" id="ribbon-span"></div>
+        <div class="marker marker-room" id="marker-room"><span>room</span></div>
+        <div class="marker marker-target" id="marker-target"><span>target</span></div>
+      </div>
+      <section class="target" id="target-block">
+        <button class="step" id="temp-down" type="button" aria-label="Lower target temperature">−</button>
+        <div class="target-temp">
+          <span id="target-temp">--</span><span class="deg">°</span>
+          <div class="target-label" id="target-label">target</div>
+        </div>
+        <button class="step" id="temp-up" type="button" aria-label="Raise target temperature">+</button>
+      </section>
+      <div class="ribbon-ends" aria-hidden="true"><span>16°</span><span>30°</span></div>
+    </section>
+
+    <section class="group" aria-label="Mode">
+      <div class="segmented" id="modes" role="radiogroup">
+        <button type="button" data-action="fan" data-value="0" role="radio">Fan</button>
+        <button type="button" data-action="cool" data-value="2" role="radio">Cool</button>
+        <button type="button" data-action="dry" data-value="3" role="radio">Dry</button>
+        <button type="button" data-action="eco" data-value="5" role="radio">Eco</button>
+      </div>
+    </section>
+
+    <section class="group" aria-label="Fan speed">
+      <div class="segmented fan" id="fans" role="radiogroup">
+        <button type="button" data-action="fanlow" data-value="2" role="radio">Low</button>
+        <button type="button" data-action="fanmed" data-value="3" role="radio">Medium</button>
+        <button type="button" data-action="fanhigh" data-value="4" role="radio">High</button>
+      </div>
+      <div class="hint" id="fan-hint"></div>
+    </section>
+
+    <div class="spacer" aria-hidden="true"></div>
+
+    <button class="power" id="power" type="button">Turn on</button>
+
+    <div class="notice" id="notice" role="status" hidden></div>
+
+    <section class="diag" id="diag" hidden aria-label="Self-check result">
+      <div class="diag-head"><span id="diag-title">Self-check</span><button type="button" class="link" id="diag-close" aria-label="Close self-check">Close</button></div>
+      <dl class="diag-rows" id="diag-rows"></dl>
+    </section>
+
+    <footer class="bottom">
+      <span id="updated">Waiting for the controller</span>
+      <span class="links">
+        <button type="button" class="link" id="diagnose">Diagnose</button>
+        <button type="button" class="link" id="refresh">Refresh</button>
+        <button type="button" class="link" id="log">Log</button>
+        <button type="button" class="link" id="quit">Quit</button>
+      </span>
+    </footer>
+  </main>
+  <script src="app.js"></script>
+  <script src="dial.js"></script>
+</body>
+</html>
